@@ -1,0 +1,4 @@
+nome=Joana
+idade=30
+pais=Portugal
+cidade=Lisboa

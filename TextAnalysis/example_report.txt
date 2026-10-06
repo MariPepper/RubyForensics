@@ -1,0 +1,51 @@
+========================================================================
+RELATÓRIO DE COMPARAÇÃO DE INTEGRIDADE
+========================================================================
+
+Ferramenta: File Integrity Comparator 0.1.0
+Ruby: 3.3.8
+Data UTC: 2026-10-06T11:20:05.968350Z
+
+FICHEIRO A
+  Caminho: /mnt/data/file_integrity_comparator/example_original.txt
+  Tamanho: 33 bytes
+  Modificado: 2026-10-06T11:20:05.879180Z
+  SHA-256: c83c8cccdf57058272e998a8a887614b84f193c855544089b18195bfb96f87eb
+
+FICHEIRO B
+  Caminho: /mnt/data/file_integrity_comparator/example_copy.txt
+  Tamanho: 48 bytes
+  Modificado: 2026-10-06T11:20:05.879304Z
+  SHA-256: 1e61ba03634564eb700b39d3bf73c5ffe14f5e648e1b140afff1a3d96de0d9ab
+
+RESULTADO: DIFERENTES
+
+Foram encontradas 2 diferença(s).
+
+------------------------------------------------------------------------
+DIFERENÇA 1: MODIFIED
+------------------------------------------------------------------------
+Linha A: 1
+Linha B: 1
+Coluna da primeira diferença: 9
+Distância de Levenshtein: 2
+Original:  "nome=Joao"
+Alterado:  "nome=Joana"
+Alterações de caracteres:
+  added na coluna 9: "n"
+  added na coluna 10: "a"
+  deleted na coluna 9: "o"
+------------------------------------------------------------------------
+DIFERENÇA 2: ADDED
+------------------------------------------------------------------------
+Linha B: 3
+Conteúdo acrescentado: "pais=Portugal"
+
+========================================================================
+NOTA FORENSE
+========================================================================
+Este relatório documenta uma comparação técnica entre dois ficheiros.
+Não determina, por si só, autenticidade jurídica, autoria ou validade da prova.
+Essas conclusões dependem da preservação da evidência, cadeia de custódia,
+procedimentos documentados e demais requisitos forenses/jurídicos aplicáveis.
+

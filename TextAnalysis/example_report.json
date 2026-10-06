@@ -1,0 +1,65 @@
+{
+  "tool": {
+    "name": "File Integrity Comparator",
+    "version": "0.1.0",
+    "ruby_version": "3.3.8"
+  },
+  "generated_at": "2026-10-06T11:20:05.968350Z",
+  "identical": false,
+  "files": {
+    "a": {
+      "path": "/mnt/data/file_integrity_comparator/example_original.txt",
+      "absolute_path": "/mnt/data/file_integrity_comparator/example_original.txt",
+      "size": 33,
+      "modified_utc": "2026-10-06T11:20:05.879180Z",
+      "sha256": "c83c8cccdf57058272e998a8a887614b84f193c855544089b18195bfb96f87eb"
+    },
+    "b": {
+      "path": "/mnt/data/file_integrity_comparator/example_copy.txt",
+      "absolute_path": "/mnt/data/file_integrity_comparator/example_copy.txt",
+      "size": 48,
+      "modified_utc": "2026-10-06T11:20:05.879304Z",
+      "sha256": "1e61ba03634564eb700b39d3bf73c5ffe14f5e648e1b140afff1a3d96de0d9ab"
+    }
+  },
+  "differences": [
+    {
+      "type": "modified",
+      "line_a": 1,
+      "line_b": 1,
+      "original": "nome=Joao",
+      "modified": "nome=Joana",
+      "column": 9,
+      "levenshtein": 2,
+      "changes": [
+        {
+          "type": "added",
+          "column": 9,
+          "value": "n"
+        },
+        {
+          "type": "added",
+          "column": 10,
+          "value": "a"
+        },
+        {
+          "type": "deleted",
+          "column": 9,
+          "value": "o"
+        }
+      ]
+    },
+    {
+      "type": "added",
+      "line_a": null,
+      "line_b": 3,
+      "original": null,
+      "modified": "pais=Portugal",
+      "column": null,
+      "levenshtein": null,
+      "changes": [
+
+      ]
+    }
+  ]
+}

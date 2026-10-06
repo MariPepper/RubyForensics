@@ -1,0 +1,3 @@
+nome=Joao
+idade=30
+cidade=Lisboa
