@@ -1,0 +1,140 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "optparse"
+require_relative "../lib/file_compare"
+require_relative "../lib/menu"
+
+options = {
+  output: nil,
+  json: nil,
+  audit: nil,
+  encoding: "UTF-8",
+  context: 0,
+  strategy: FileIntegrityComparator::LineMatcher::DEFAULT_STRATEGY,
+  normalize: :nfc,
+  max_absolute: FileIntegrityComparator::LineMatcher::DEFAULT_MAX_ABSOLUTE,
+  relative_ratio: FileIntegrityComparator::LineMatcher::DEFAULT_RELATIVE_RATIO,
+  no_menu: false
+}
+
+parser = OptionParser.new do |opts|
+  opts.banner = "Uso: filecompare [opções] FICHEIRO_A FICHEIRO_B"
+
+  opts.on("-o", "--output FICHEIRO", "Relatório de texto") { |v| options[:output] = v }
+  opts.on("-j", "--json FICHEIRO", "Relatório JSON") { |v| options[:json] = v }
+  opts.on("-a", "--audit FICHEIRO", "Log de auditoria encadeado") { |v| options[:audit] = v }
+  opts.on("-e", "--encoding CODIFICACAO", "Codificação textual (UTF-8 por defeito)") { |v| options[:encoding] = v }
+  opts.on("-c", "--context N", Integer, "Linhas de contexto (reservado para extensões)") { |v| options[:context] = v }
+
+  opts.on("-s", "--strategy NOME", %w[greedy hungarian],
+          "Algoritmo de emparelhamento: greedy ou hungarian") do |v|
+    options[:strategy] = v.to_sym
+  end
+
+  opts.on("--normalize FORMA", %w[nfc nfd none],
+          "Normalização Unicode antes de comparar (default: nfc)") do |v|
+    options[:normalize] = v.to_sym
+  end
+
+  opts.on("--max-absolute N", Integer,
+          "Máximo absoluto de edições para aceitar como modificação") do |v|
+    options[:max_absolute] = v
+  end
+
+  opts.on("--relative-ratio F", Float,
+          "Fracção do comprimento da linha usada como threshold") do |v|
+    options[:relative_ratio] = v
+  end
+
+  opts.on("--no-menu", "Não mostrar o menu interactivo") do
+    options[:no_menu] = true
+  end
+
+  opts.on("-h", "--help", "Mostrar ajuda") do
+    puts opts
+    exit
+  end
+end
+
+begin
+  # Guardar os argumentos antes de o OptionParser os consumir.
+  raw_argv = ARGV.dup
+
+  parser.parse!
+  if ARGV.length != 2
+    warn parser
+    exit 2
+  end
+
+  # Detectar flags passadas explicitamente.
+  strategy_explicit = raw_argv.any? do |a|
+    a == "--strategy" || a == "-s" || a.start_with?("--strategy=")
+  end
+
+  normalize_explicit = raw_argv.any? do |a|
+    a == "--normalize" || a.start_with?("--normalize=")
+  end
+
+  # Menu interactivo apenas quando faz sentido.
+  if !options[:no_menu] &&
+     !strategy_explicit &&
+     !normalize_explicit &&
+     FileIntegrityComparator::Menu.interactive?
+
+    menu = FileIntegrityComparator::Menu.new
+    chosen = menu.ask(
+      strategy: options[:strategy],
+      normalize: options[:normalize],
+      max_absolute: options[:max_absolute],
+      relative_ratio: options[:relative_ratio]
+    )
+    options.merge!(chosen)
+    puts
+  end
+
+  result = FileIntegrityComparator::Comparator.new(
+    ARGV[0],
+    ARGV[1],
+    encoding: options[:encoding],
+    normalize: options[:normalize],
+    max_absolute: options[:max_absolute],
+    relative_ratio: options[:relative_ratio],
+    strategy: options[:strategy]
+  ).compare
+
+  report = FileIntegrityComparator::Report.new(result)
+  audit = FileIntegrityComparator::AuditLog.new(options[:audit]) if options[:audit]
+
+  if audit
+    audit.record("comparison_started", {
+      file_a: result.file_a,
+      file_b: result.file_b,
+      sha256_a: result.sha256_a,
+      sha256_b: result.sha256_b,
+      match_method: result.match_method
+    })
+    audit.record("comparison_finished", {
+      identical: result.identical,
+      difference_count: result.differences.length
+    })
+    audit.close
+  end
+
+  text = report.to_text
+  puts text
+
+  File.write(options[:output], text, mode: "w:UTF-8") if options[:output]
+  File.write(options[:json], report.to_json, mode: "w:UTF-8") if options[:json]
+
+  exit(result.identical ? 0 : 1)
+rescue Errno::ENOENT => e
+  warn "Erro: ficheiro não encontrado: #{e.message}"
+  exit 2
+rescue ArgumentError => e
+  warn "Erro: #{e.message}"
+  exit 2
+rescue EncodingError => e
+  warn "Erro de codificação: #{e.message}"
+  exit 2
+end
