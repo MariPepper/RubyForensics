@@ -1,0 +1,791 @@
+require "time"
+
+# ==========================================
+# ANALISE DE RECONEXOES DOS EQUIPAMENTOS
+# Versao 8
+#   - Base: Versao 7
+#   - Alteracoes:
+#       * Opcao 7 passa a ser um gestor de blacklist persistente
+#         (ficheiro blacklist.txt, gravado a cada alteracao)
+#       * Blacklist carregada automaticamente ao arrancar
+# ==========================================
+
+HORA_INICIO_DEFAULT = "08:00"
+HORA_FIM_DEFAULT    = "20:00"
+
+# ==========================================
+# EXPRESSOES REGULARES
+# ==========================================
+
+OCTETO = /(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)/
+EXP_REG_ID   = /^11,/
+EXP_REG_IP   = /\b#{OCTETO}\.#{OCTETO}\.#{OCTETO}\.#{OCTETO}\b/
+EXP_REG_MAC  = /[0-9A-Fa-f]{12}/
+EXP_REG_DATA = /(\d{2}\/\d{2}\/(?:\d{4}|\d{2})),(\d{2}:\d{2}:\d{2})/
+
+EXP_REG_DNS_OK   = /\b(DNS_OK|DNS_SUCCESS|RESOLVED|RESOLVE_OK)\b/i
+EXP_REG_DNS_FAIL = /\b(DNS_FAIL|NXDOMAIN|SERVFAIL|NO_RESOLVE|RESOLVE_FAIL)\b/i
+EXP_REG_NACK     = /\bNACK\b/i
+EXP_REG_PAIS     = /\b(?:CC|country|pais)\s*[=:]\s*([A-Za-z]{2})\b/i
+
+# ==========================================
+# CONSTANTES
+# ==========================================
+
+RFC1918_CIDRS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"].freeze
+DOC_CIDRS_DEFAULT = ["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"].freeze
+BLACKLIST_PATH_DEFAULT = File.join(__dir__, "blacklist.txt")
+
+# ==========================================
+# FUNCOES AUXILIARES
+# ==========================================
+
+def ip_para_inteiro(ip)
+  octetos = ip.to_s.split(".")
+  return nil if octetos.length != 4
+  valores = octetos.map { |o| Integer(o, 10) rescue nil }
+  return nil if valores.any?(&:nil?) || valores.any? { |v| v < 0 || v > 255 }
+  valores.reduce(0) { |acc, v| (acc << 8) | v }
+end
+
+def ip_na_rede_cidr?(ip, cidr)
+  rede_str, mascara_str = cidr.split("/", 2)
+  mascara = mascara_str ? mascara_str.to_i : 32
+  return false unless mascara.between?(0, 32)
+
+  ip_int   = ip_para_inteiro(ip)
+  rede_int = ip_para_inteiro(rede_str)
+  return false if ip_int.nil? || rede_int.nil?
+  return true if mascara.zero?
+
+  bits_de_host = 32 - mascara
+  (ip_int >> bits_de_host) == (rede_int >> bits_de_host)
+end
+
+def ip_interno?(ip, redes_internas)
+  redes = (redes_internas.nil? || redes_internas.empty?) ? RFC1918_CIDRS : redes_internas
+  redes.any? { |rede| ip_na_rede_cidr?(ip, rede) }
+end
+
+def ip_documentacao?(ip, redes_doc)
+  redes_doc.any? { |rede| ip_na_rede_cidr?(ip, rede) }
+end
+
+def ip_na_blacklist?(ip, blacklist)
+  return false if blacklist.nil? || blacklist.empty?
+  blacklist.any? { |rede| ip_na_rede_cidr?(ip, rede) }
+end
+
+# Verifica se a string e' um IP ou CIDR IPv4 plausivel.
+def cidr_valido?(str)
+  return false if str.nil? || str.empty?
+  rede_str, mascara_str = str.split("/", 2)
+  return false if ip_para_inteiro(rede_str).nil?
+  return true if mascara_str.nil?
+  mascara_str =~ /^\d+$/ && mascara_str.to_i.between?(0, 32)
+end
+
+# Ponto 1: deteta o formato do ano pelo conteudo (ultimo campo apos "/").
+def parse_data_hora(data_str, hora_str)
+  ultimo = data_str.split("/").last
+  formato = ultimo.length == 4 ? "%d/%m/%Y" : "%d/%m/%y"
+  Time.strptime("#{data_str},#{hora_str}", "#{formato},%H:%M:%S")
+end
+
+def minutos_do_dia(hhmm)
+  h, m = hhmm.split(":").map(&:to_i)
+  h * 60 + m
+end
+
+def fora_do_horario?(data_hora, hora_inicio, hora_fim)
+  ini = minutos_do_dia(hora_inicio)
+  fim = minutos_do_dia(hora_fim)
+  evento = data_hora.hour * 60 + data_hora.min
+  dentro =
+    if ini <= fim
+      evento >= ini && evento < fim
+    else
+      evento >= ini || evento < fim
+    end
+  !dentro
+end
+
+def bucket_intervalo(seg)
+  case seg
+  when 0..0       then "0s"
+  when 1..1       then "1s"
+  when 2..4       then "2-4s"
+  when 5..9       then "5-9s"
+  when 10..29     then "10-29s"
+  when 30..59     then "30-59s"
+  when 60..299    then "1-5min"
+  when 300..3599  then "5-60min"
+  else                 ">1h"
+  end
+end
+
+# ==========================================
+# BLACKLIST: leitura / escrita
+# ==========================================
+
+def carregar_blacklist(caminho)
+  return [] unless caminho && File.exist?(caminho)
+  entradas = []
+  File.foreach(caminho) do |linha|
+    linha = linha.sub("\uFEFF", "").strip
+    next if linha.empty? || linha.start_with?("#")
+    cidr = linha.split(",").first.strip
+    next if cidr.empty?
+    entradas << cidr
+  end
+  entradas.uniq
+end
+
+def guardar_blacklist(caminho, entradas)
+  File.write(caminho, entradas.join("\n") + (entradas.empty? ? "" : "\n"))
+end
+
+# ==========================================
+# GEOCODER - CARREGAMENTO E PESQUISA
+# ==========================================
+
+def carregar_geocode(caminho)
+  return [] unless caminho && File.exist?(caminho)
+  tabela = []
+
+  File.foreach(caminho) do |linha|
+    linha = linha.sub("\uFEFF", "").strip
+    next if linha.empty? || linha.start_with?("#")
+
+    partes = linha.split(",").map(&:strip)
+    next if partes.length < 2
+
+    if partes.length >= 3 &&
+       partes[0] =~ /^\d+\.\d+\.\d+\.\d+$/ &&
+       partes[1] =~ /^\d+\.\d+\.\d+\.\d+$/
+      ini = ip_para_inteiro(partes[0])
+      fim = ip_para_inteiro(partes[1])
+      cc  = partes[2].upcase
+      next if ini.nil? || fim.nil? || ini > fim
+      tabela << [:range, ini, fim, cc]
+    else
+      cidr = partes[0]
+      cc   = partes[1].upcase
+      tabela << [:cidr, cidr, cc]
+    end
+  end
+
+  tabela
+end
+
+# Ponto 4: constroi um indice ordenado por intervalo [ini, fim, cc].
+def construir_indice_geocode(tabela)
+  return [] if tabela.nil? || tabela.empty?
+  intervalos = []
+
+  tabela.each do |entrada|
+    if entrada[0] == :cidr
+      cidr = entrada[1]
+      cc   = entrada[2]
+      rede_str, mascara_str = cidr.split("/", 2)
+      mascara = mascara_str ? mascara_str.to_i : 32
+      next unless mascara.between?(0, 32)
+      rede_int = ip_para_inteiro(rede_str)
+      next if rede_int.nil?
+
+      bits_host = 32 - mascara
+      tamanho   = mascara.zero? ? (2**32) : (1 << bits_host)
+      intervalos << [rede_int, rede_int + tamanho - 1, cc]
+    else
+      intervalos << [entrada[1], entrada[2], entrada[3]]
+    end
+  end
+
+  intervalos.sort_by! { |ini, fim, _| [ini, -(fim - ini)] }
+  intervalos
+end
+
+# Ponto 4: pesquisa binaria no indice de intervalos.
+def pais_do_ip_rapido(ip, indice)
+  return "??" if indice.nil? || indice.empty?
+  ip_int = ip_para_inteiro(ip)
+  return "??" if ip_int.nil?
+
+  i = indice.bsearch_index { |ini, _, _| ini > ip_int }
+  i = (i.nil? ? indice.length : i) - 1
+
+  while i >= 0
+    ini, fim, cc = indice[i]
+    return cc if ip_int.between?(ini, fim)
+    i -= 1
+    break if i >= 0 && indice[i][0] < ip_int - (1 << 20)
+  end
+  "??"
+end
+
+def pais_do_log(linha)
+  m = linha.match(EXP_REG_PAIS)
+  m ? m[1].upcase : nil
+end
+
+# ==========================================
+# MENU
+# ==========================================
+
+def mostrar_menu(config)
+  puts
+  puts "=========================================="
+  puts " MENU DE CONFIGURACAO"
+  puts "=========================================="
+  puts "1.  Ficheiro de log                 [#{config[:ficheiro]}]"
+  puts "2.  Limite de reconexao (segundos)  [#{config[:limite_segundos]}s]"
+  puts "3.  Horario permitido               [#{config[:hora_inicio]} - #{config[:hora_fim]}]"
+  puts "4.  Rede interna (CIDR)             [#{config[:redes_internas].empty? ? 'RFC 1918' : config[:redes_internas].join(', ')}]"
+  puts "5.  Guardar relatorio em ficheiro   [#{config[:ficheiro_saida] || 'Nao'}]"
+  puts "6.  IPs de documentacao (CIDR)      [#{config[:redes_doc].join(', ')}]"
+  puts "7.  Blacklist (CIDR)                [#{config[:blacklist].empty? ? 'vazia' : "#{config[:blacklist].length} entrada(s)"}]"
+  puts "8.  Geocoder (ficheiro IP,CC)       [#{config[:geocode_file] || 'Nenhum'}]"
+  puts "9.  Repeticoes minimas p/ alerta    [#{config[:repeticoes_alerta]}]"
+  puts "10. Horas distintas p/ alerta IP    [#{config[:horas_distintas_alerta]}]"
+  puts
+  puts "11. INICIAR ANALISE"
+  puts "0.  Sair"
+  puts "=========================================="
+  print "Escolha uma opcao: "
+end
+
+# ==========================================
+# GESTAO DA BLACKLIST
+# ==========================================
+
+def gerir_blacklist(config)
+  caminho = config[:blacklist_file] || BLACKLIST_PATH_DEFAULT
+
+  loop do
+    puts
+    puts "----- GESTAO DE BLACKLIST -----"
+    puts "Ficheiro: #{caminho}"
+    puts "Entradas atuais: #{config[:blacklist].length}"
+    puts "1. Ver blacklist"
+    puts "2. Adicionar IP/CIDR"
+    puts "3. Remover IP/CIDR"
+    puts "4. Recarregar do ficheiro"
+    puts "5. Esvaziar blacklist (e ficheiro)"
+    puts "0. Voltar"
+    print "Opcao: "
+    op = gets&.chomp
+
+    case op
+    when "1"
+      if config[:blacklist].empty?
+        puts "(blacklist vazia)"
+      else
+        config[:blacklist].each_with_index { |c, i| puts "  #{i + 1}. #{c}" }
+      end
+
+    when "2"
+      print "IP/CIDR a adicionar (varios separados por virgula): "
+      valor = gets&.chomp
+      if valor.nil? || valor.strip.empty?
+        puts "Nada a adicionar."
+        next
+      end
+      novos = valor.split(",").map(&:strip).reject(&:empty?)
+      invalidos = novos.reject { |c| cidr_valido?(c) }
+      if invalidos.any?
+        puts "Ignorados (formato invalido): #{invalidos.join(', ')}"
+      end
+      aceites = novos.select { |c| cidr_valido?(c) } - config[:blacklist]
+      if aceites.empty?
+        puts "Nada de novo a adicionar."
+      else
+        config[:blacklist].concat(aceites)
+        guardar_blacklist(caminho, config[:blacklist])
+        puts "Adicionados: #{aceites.join(', ')}"
+        puts "Blacklist agora tem #{config[:blacklist].length} entrada(s)."
+      end
+
+    when "3"
+      if config[:blacklist].empty?
+        puts "Blacklist ja' esta vazia."
+        next
+      end
+      config[:blacklist].each_with_index { |c, i| puts "  #{i + 1}. #{c}" }
+      print "Numero(s) a remover (separados por virgula): "
+      valor = gets&.chomp
+      indices = (valor || "").split(",").map { |s| s.strip.to_i - 1 }.select { |i| i >= 0 }
+      remover = indices.map { |i| config[:blacklist][i] }.compact.uniq
+      if remover.empty?
+        puts "Nada removido."
+      else
+        config[:blacklist] -= remover
+        guardar_blacklist(caminho, config[:blacklist])
+        puts "Removidos: #{remover.join(', ')}"
+      end
+
+    when "4"
+      config[:blacklist] = carregar_blacklist(caminho)
+      puts "Recarregadas #{config[:blacklist].length} entrada(s)."
+
+    when "5"
+      config[:blacklist] = []
+      guardar_blacklist(caminho, [])
+      puts "Blacklist esvaziada."
+
+    when "0"
+      break
+
+    else
+      puts "Opcao invalida."
+    end
+  end
+end
+
+# ==========================================
+# MENU PRINCIPAL
+# ==========================================
+
+def executar_menu
+  caminho_blacklist = BLACKLIST_PATH_DEFAULT
+
+  config = {
+    ficheiro: "ficheiro.log",
+    limite_segundos: 60,
+    hora_inicio: HORA_INICIO_DEFAULT,
+    hora_fim: HORA_FIM_DEFAULT,
+    redes_internas: [],
+    ficheiro_saida: nil,
+    redes_doc: DOC_CIDRS_DEFAULT.dup,
+    blacklist: carregar_blacklist(caminho_blacklist),
+    blacklist_file: caminho_blacklist,
+    geocode_file: nil,
+    geocode_tabela: [],
+    geocode_indice: [],
+    repeticoes_alerta: 5,
+    horas_distintas_alerta: 3
+  }
+
+  loop do
+    mostrar_menu(config)
+    opcao = gets&.chomp
+
+    case opcao
+    when "1"
+      print "Novo nome/caminho do ficheiro de log: "
+      novo = gets&.chomp
+      config[:ficheiro] = novo unless novo.nil? || novo.strip.empty?
+
+    when "2"
+      print "Novo limite em segundos: "
+      valor = gets&.chomp
+      config[:limite_segundos] = valor.to_i if valor && valor.to_i > 0
+
+    when "3"
+      print "Nova hora de inicio (HH:MM): "
+      ini = gets&.chomp
+      print "Nova hora de fim (HH:MM): "
+      fim = gets&.chomp
+      if ini =~ /^\d{2}:\d{2}$/ && fim =~ /^\d{2}:\d{2}$/
+        config[:hora_inicio] = ini
+        config[:hora_fim] = fim
+      else
+        puts "Formato invalido. Mantidos os valores anteriores."
+      end
+
+    when "4"
+      puts "Redes internas em CIDR, separadas por virgulas."
+      puts "(vazio = RFC 1918: 10/8, 172.16/12, 192.168/16)"
+      print "Redes/IPs: "
+      valor = gets&.chomp
+      config[:redes_internas] = (valor.nil? || valor.strip.empty?) ? [] :
+        valor.split(",").map(&:strip).reject(&:empty?)
+
+    when "5"
+      print "Nome do ficheiro de saida (vazio = nao guardar): "
+      valor = gets&.chomp
+      config[:ficheiro_saida] = (valor.nil? || valor.strip.empty?) ? nil : valor
+
+    when "6"
+      puts "IPs reservadas para documentacao (RFC 5737 por omissao)."
+      puts "Sugestoes: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24"
+      puts "(vazio = repor omissao RFC 5737)"
+      print "CIDRs: "
+      valor = gets&.chomp
+      if valor.nil? || valor.strip.empty?
+        config[:redes_doc] = DOC_CIDRS_DEFAULT.dup
+      else
+        config[:redes_doc] = valor.split(",").map(&:strip).reject(&:empty?)
+      end
+
+    when "7"
+      gerir_blacklist(config)
+
+    when "8"
+      puts "Ficheiro geocoder nos formatos:"
+      puts "  CIDR,CC              -> ex.: 192.168.0.0/16,PT"
+      puts "  IP_INI,IP_FIM,CC     -> ex.: 223.255.128.0,223.255.191.255,HK"
+      print "Caminho do ficheiro (vazio = sem geocoder): "
+      valor = gets&.chomp
+
+      if valor.nil? || valor.strip.empty?
+        config[:geocode_file] = nil
+        config[:geocode_tabela] = []
+        config[:geocode_indice] = []
+        puts "Geocoder removido."
+      else
+        caminho = valor.strip
+
+        if !File.exist?(caminho)
+          alternativo = File.join(__dir__, caminho)
+          caminho = alternativo if File.exist?(alternativo)
+        end
+
+        if !File.exist?(caminho)
+          puts "ERRO: ficheiro '#{caminho}' nao encontrado."
+          puts "Pasta atual:     #{Dir.pwd}"
+          puts "Pasta do script: #{__dir__}"
+          puts "Ficheiros .txt/.csv na pasta do script:"
+          Dir.glob(File.join(__dir__, "*.{txt,csv}")).each { |f| puts "  - #{f}" }
+        elsif File.zero?(caminho)
+          puts "ERRO: ficheiro '#{caminho}' esta vazio."
+        else
+          config[:geocode_file] = caminho
+          config[:geocode_tabela] = carregar_geocode(caminho)
+          config[:geocode_indice] = construir_indice_geocode(config[:geocode_tabela])
+          puts "Carregadas #{config[:geocode_tabela].length} entradas " \
+               "(indice com #{config[:geocode_indice].length} intervalos)."
+
+          if config[:geocode_tabela].empty?
+            puts "AVISO: ficheiro existe mas nenhuma linha foi aceite."
+            puts "Primeiras 3 linhas:"
+            File.foreach(caminho).first(3).each { |l| puts "  > #{l.chomp}" }
+          end
+        end
+      end
+
+    when "9"
+      print "Numero minimo de repeticoes (IP,MAC) para alerta: "
+      valor = gets&.chomp
+      config[:repeticoes_alerta] = valor.to_i if valor && valor.to_i > 0
+
+    when "10"
+      print "Numero minimo de horas distintas para alertar IP: "
+      valor = gets&.chomp
+      config[:horas_distintas_alerta] = valor.to_i if valor && valor.to_i > 0
+
+    when "11"
+      analisar(config)
+
+    when "0"
+      puts "A sair..."
+      break
+
+    else
+      puts "Opcao invalida."
+    end
+  end
+end
+
+# ==========================================
+# ANALISE PRINCIPAL
+# ==========================================
+
+def analisar(config)
+  saida = []
+  registar = lambda do |linha|
+    puts linha
+    saida << linha
+  end
+
+  registar.call("==========================================")
+  registar.call(" Analise das reconexoes dos equipamentos")
+  registar.call(" Versao 8 - blacklist persistente")
+  registar.call("==========================================")
+  registar.call("Horario permitido: #{config[:hora_inicio]} - #{config[:hora_fim]}")
+  registar.call("Limite de reconexao suspeita: #{config[:limite_segundos]}s")
+  registar.call("IPs documentacao: #{config[:redes_doc].join(', ')}")
+  registar.call("Blacklist: #{config[:blacklist].empty? ? '(vazia)' : "#{config[:blacklist].length} entrada(s)"}")
+  registar.call("Geocoder: #{config[:geocode_file] || '(nenhum)'} " \
+                "(#{config[:geocode_tabela].length} entradas, " \
+                "#{config[:geocode_indice].length} intervalos indexados)")
+  registar.call("")
+
+  unless File.exist?(config[:ficheiro])
+    puts "ERRO: ficheiro '#{config[:ficheiro]}' nao encontrado."
+    return
+  end
+
+  ultima_ocorrencia = {}
+  contagem_ip       = Hash.new(0)
+  ips_suspeitos     = Hash.new(0)
+  ips_fora_horario  = Hash.new(0)
+  ips_externos      = Hash.new(0)
+  ips_doc           = Hash.new(0)
+  ips_blacklist     = Hash.new(0)
+  ip_para_pais      = {}
+  ips_para_macs     = Hash.new { |h, k| h[k] = Hash.new(0) }
+  macs_para_ips     = Hash.new { |h, k| h[k] = Hash.new(0) }
+  horas_por_ip      = Hash.new { |h, k| h[k] = {} }
+
+  dns_ok   = Hash.new(0)
+  dns_fail = Hash.new(0)
+  nack     = Hash.new(0)
+
+  buckets_intervalo = Hash.new(0)
+  buckets_por_ip    = Hash.new { |h, k| h[k] = Hash.new(0) }
+
+  repeticoes_par = Hash.new(0)
+
+  geocode_indice = config[:geocode_indice] || construir_indice_geocode(config[:geocode_tabela])
+
+  File.open(config[:ficheiro], "r") do |f1|
+    f1.each_line do |linha|
+      linha = linha.gsub(/\\[rn]+\z/, "").chomp
+
+      next unless linha =~ EXP_REG_ID
+
+      ip = linha[EXP_REG_IP]
+      next unless ip
+
+      mac = linha[EXP_REG_MAC]
+      mac = mac.strip.upcase if mac
+
+      data = linha.match(EXP_REG_DATA)
+      next unless data
+      begin
+        data_hora = parse_data_hora(data[1], data[2])
+      rescue ArgumentError
+        next
+      end
+
+      externo   = !ip_interno?(ip, config[:redes_internas])
+      doc_flag  = ip_documentacao?(ip, config[:redes_doc])
+      bl_flag   = ip_na_blacklist?(ip, config[:blacklist])
+
+      pais = pais_do_log(linha)
+      pais ||= pais_do_ip_rapido(ip, geocode_indice)
+
+      contagem_ip[ip] += 1
+      horas_por_ip[ip][data_hora.hour] = true
+      ip_para_pais[ip] ||= pais
+
+      ips_externos[ip]  += 1 if externo
+      ips_doc[ip]       += 1 if doc_flag
+      ips_blacklist[ip] += 1 if bl_flag
+
+      if mac
+        ips_para_macs[ip][mac] += 1
+        macs_para_ips[mac][ip] += 1
+        repeticoes_par[[ip, mac]] += 1
+      end
+
+      dns_ok[ip]   += 1 if linha =~ EXP_REG_DNS_OK
+      dns_fail[ip] += 1 if linha =~ EXP_REG_DNS_FAIL
+      nack[ip]     += 1 if linha =~ EXP_REG_NACK
+
+      fora_flag = false
+      if fora_do_horario?(data_hora, config[:hora_inicio], config[:hora_fim])
+        ips_fora_horario[ip] += 1
+        fora_flag = true
+      end
+
+      unless ultima_ocorrencia.key?(ip)
+        ultima_ocorrencia[ip] = data_hora
+        registar.call("IP: #{ip} (#{externo ? 'EXTERNO' : 'interno'}) | MAC: #{mac} | Pais: #{pais}")
+        registar.call("Primeira ocorrencia: #{data_hora}")
+        registar.call("***** ALERTA: IP EXTERNO *****") if externo
+        registar.call("***** ALERTA: IP DE DOCUMENTACAO *****") if doc_flag
+        registar.call("***** ALERTA: IP EM BLACKLIST *****") if bl_flag
+        registar.call("***** OCORRENCIA FORA DO HORARIO *****") if fora_flag
+        registar.call("")
+        next
+      end
+
+      anterior = ultima_ocorrencia[ip]
+      diferenca = (data_hora - anterior).to_i
+      horas, resto = diferenca.divmod(3600)
+      minutos, segundos = resto.divmod(60)
+
+      bucket = bucket_intervalo(diferenca)
+      buckets_intervalo[bucket] += 1
+      buckets_por_ip[ip][bucket] += 1
+
+      registar.call("IP: #{ip} (#{externo ? 'EXTERNO' : 'interno'}) | MAC: #{mac} | Pais: #{pais}")
+      registar.call("Anterior: #{anterior}")
+      registar.call("Atual:    #{data_hora}")
+      registar.call("Diferenca: #{horas}h #{minutos}m #{segundos}s (bucket #{bucket})")
+
+      if diferenca < config[:limite_segundos]
+        registar.call("***** RECONEXAO INFERIOR A #{config[:limite_segundos]}s *****")
+        ips_suspeitos[ip] += 1
+      end
+
+      registar.call("***** ALERTA: IP EXTERNO *****") if externo
+      registar.call("***** ALERTA: IP DE DOCUMENTACAO *****") if doc_flag
+      registar.call("***** ALERTA: IP EM BLACKLIST *****") if bl_flag
+      registar.call("***** OCORRENCIA FORA DO HORARIO *****") if fora_flag
+      registar.call("")
+
+      ultima_ocorrencia[ip] = data_hora
+    end
+  end
+
+  # ==========================================
+  # RESUMO POR IP
+  # ==========================================
+  registar.call("")
+  registar.call("==========================================")
+  registar.call(" RESUMO POR IP")
+  registar.call("==========================================")
+  registar.call("IPs distintos: #{ultima_ocorrencia.length}")
+  registar.call("")
+
+  ultima_ocorrencia.each_key do |ip|
+    motivos = []
+    motivos << "reconexoes<#{config[:limite_segundos]}s (#{ips_suspeitos[ip]}x)" if ips_suspeitos[ip] > 0
+    motivos << "fora horario (#{ips_fora_horario[ip]}x)" if ips_fora_horario[ip] > 0
+    motivos << "EXTERNO (#{ips_externos[ip]}x)" if ips_externos[ip] > 0
+    motivos << "DOC (#{ips_doc[ip]}x)" if ips_doc[ip] > 0
+    motivos << "BLACKLIST (#{ips_blacklist[ip]}x)" if ips_blacklist[ip] > 0
+    motivos << "DNS_OK=#{dns_ok[ip]} DNS_FAIL=#{dns_fail[ip]}" if dns_ok[ip] + dns_fail[ip] > 0
+    motivos << "NACK=#{nack[ip]}" if nack[ip] > 0
+    if horas_por_ip[ip].size >= config[:horas_distintas_alerta]
+      motivos << "aparece em #{horas_por_ip[ip].size} horas distintas"
+    end
+    if ips_para_macs[ip].size > 1
+      motivos << "associado a #{ips_para_macs[ip].size} MACs"
+    end
+
+    linha = "#{ip} (#{ip_para_pais[ip]}) ocorrencias=#{contagem_ip[ip]}"
+    linha += motivos.empty? ? " <-- normal" : " <-- SUSPEITO: #{motivos.join(' | ')}"
+    registar.call(linha)
+  end
+
+  # ==========================================
+  # RESUMO POR MAQUINA (MAC)
+  # ==========================================
+  registar.call("")
+  registar.call("==========================================")
+  registar.call(" RESUMO POR MAQUINA (MAC)")
+  registar.call("==========================================")
+
+  macs_para_ips.each do |mac, mapa_ips|
+    total = mapa_ips.values.sum
+    ips_unicos = mapa_ips.keys
+    flag = ips_unicos.size > 1 ? " <-- SUSPEITO: MAC associado a #{ips_unicos.size} IPs" : ""
+    registar.call("MAC #{mac}: #{total} ocorrencia(s), IPs=#{ips_unicos.join(', ')}#{flag}")
+  end
+
+  # ==========================================
+  # RESUMO POR PAIS
+  # ==========================================
+  registar.call("")
+  registar.call("==========================================")
+  registar.call(" RESUMO POR PAIS")
+  registar.call("==========================================")
+  contagem_pais = Hash.new(0)
+  contagem_pais_ips = Hash.new { |h, k| h[k] = {} }
+  contagem_ip.each do |ip, n|
+    cc = ip_para_pais[ip] || "??"
+    contagem_pais[cc] += n
+    contagem_pais_ips[cc][ip] = true
+  end
+  if contagem_pais.empty?
+    registar.call("(sem dados de pais)")
+  else
+    contagem_pais.sort_by { |_, v| -v }.each do |cc, n|
+      registar.call("#{cc}: #{n} ocorrencia(s) em #{contagem_pais_ips[cc].size} IP(s)")
+    end
+  end
+
+  # ==========================================
+  # BUCKETS DE INTERVALOS
+  # ==========================================
+  registar.call("")
+  registar.call("==========================================")
+  registar.call(" DISTRIBUICAO DOS INTERVALOS")
+  registar.call("==========================================")
+  ordem = ["0s","1s","2-4s","5-9s","10-29s","30-59s","1-5min","5-60min",">1h"]
+  ordem.each do |b|
+    next if buckets_intervalo[b].zero?
+    registar.call("#{b.ljust(8)} -> #{buckets_intervalo[b]}")
+  end
+
+  # ==========================================
+  # PADROES REPETITIVOS
+  # ==========================================
+  registar.call("")
+  registar.call("==========================================")
+  registar.call(" PADROES REPETITIVOS (par IP/MAC)")
+  registar.call("==========================================")
+  repetidos = repeticoes_par.select { |_, v| v >= config[:repeticoes_alerta] }
+  if repetidos.empty?
+    registar.call("(nenhum par IP/MAC atingiu #{config[:repeticoes_alerta]} repeticoes)")
+  else
+    repetidos.sort_by { |_, v| -v }.each do |(ip, mac), n|
+      registar.call("#{ip} / #{mac} -> #{n} repeticoes")
+    end
+  end
+
+  # ==========================================
+  # DNS / NACK
+  # ==========================================
+  registar.call("")
+  registar.call("==========================================")
+  registar.call(" DNS E NACK")
+  registar.call("==========================================")
+  todos = (dns_ok.keys | dns_fail.keys | nack.keys)
+  if todos.empty?
+    registar.call("(sem registos DNS/NACK detetados)")
+  else
+    todos.sort.each do |ip|
+      registar.call("#{ip}: DNS_OK=#{dns_ok[ip]} DNS_FAIL=#{dns_fail[ip]} NACK=#{nack[ip]}")
+    end
+  end
+
+  # ==========================================
+  # IPs DE DOCUMENTACAO / BLACKLIST / EXTERNOS
+  # ==========================================
+  if ips_doc.any?
+    registar.call("")
+    registar.call("==========================================")
+    registar.call(" IPs DE DOCUMENTACAO DETETADOS")
+    registar.call("==========================================")
+    ips_doc.each { |ip, n| registar.call("#{ip} -> #{n} ocorrencia(s)") }
+  end
+
+  if ips_blacklist.any?
+    registar.call("")
+    registar.call("==========================================")
+    registar.call(" IPs EM BLACKLIST")
+    registar.call("==========================================")
+    ips_blacklist.each { |ip, n| registar.call("#{ip} -> #{n} ocorrencia(s)") }
+  end
+
+  if ips_externos.any?
+    registar.call("")
+    registar.call("==========================================")
+    registar.call(" IPs EXTERNOS")
+    registar.call("==========================================")
+    ips_externos.each { |ip, n| registar.call("#{ip} -> #{n} ocorrencia(s)") }
+  end
+
+  registar.call("")
+  registar.call("==========================================")
+  registar.call(" FIM DA ANALISE")
+  registar.call("==========================================")
+
+  if config[:ficheiro_saida]
+    File.write(config[:ficheiro_saida], saida.join("\n") + "\n")
+    puts
+    puts "Relatorio guardado em: #{config[:ficheiro_saida]}"
+  end
+end
+
+# ==========================================
+# PONTO DE ENTRADA
+# ==========================================
+
+if __FILE__ == $0
+  executar_menu
+end
