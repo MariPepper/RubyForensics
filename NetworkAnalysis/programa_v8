@@ -18,7 +18,7 @@ HORA_FIM_DEFAULT    = "20:00"
 # ==========================================
 
 OCTETO = /(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)/
-EXP_REG_ID   = /^11,/
+EXP_REG_ID   = /^\d+,/
 EXP_REG_IP   = /\b#{OCTETO}\.#{OCTETO}\.#{OCTETO}\.#{OCTETO}\b/
 EXP_REG_MAC  = /[0-9A-Fa-f]{12}/
 EXP_REG_DATA = /(\d{2}\/\d{2}\/(?:\d{4}|\d{2})),(\d{2}:\d{2}:\d{2})/
