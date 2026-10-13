@@ -1,0 +1,15 @@
+# ==========================================
+# BLACKLIST - um IP ou CIDR por linha
+# ==========================================
+# Regras (conforme o script):
+#   - Linhas vazias e linhas iniciadas por # sao ignoradas
+#   - Apenas o primeiro campo antes da virgula conta
+#     (podes usar o resto da linha como comentario)
+#   - IP simples e' tratado como /32
+#
+# Entradas ativas:
+
+203.0.113.45
+198.51.100.0/24,gama suspeita
+45.133.1.0/24,scanner conhecido
+185.220.101.7,no de saida Tor
